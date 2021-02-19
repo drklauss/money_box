@@ -1,0 +1,359 @@
+/**
+ * Первые 8 байт в EEPROM - показания с датчиков, по 2 байта на каждое измерение, т.к. 1 байта недостаточно
+ * Следующие за 8 байт - количество монет определеннго номинала, идущие последовательно друг за другом
+ * Для увелечения стабильности работы системы от низкого напряжения (питание от 18650) снижаю частоту МК в 2 - до 8МГц
+ * Поэтому все millis() будут отрабатывать в 2 раза дольше
+ **/
+#include <LowPower.h>
+#include <avr/eeprom.h>
+#include <avr/power.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#define BTN_AWAKE 2      // кнопка "проснуться"
+#define BTN_SERVICE 3    // кнопка калибровкии сброса
+#define IR_POWER 4       // питание фототранзистора
+#define LED_POWER 5      // питание светодиода
+#define IR_VALUE A3      // сигнал фототранзистора
+#define COIN_COUNT 4     // число монет, которые нужно распознать
+#define SLEEP_TIME 15000 // время бездействия, через которое система уйдёт в сон (миллисекунды)
+
+volatile boolean is_sleep = true;              // признак сна
+float total = 0;                               // сумма монет в копилке
+int coin_nominals[COIN_COUNT] = {1, 2, 5, 10}; // номинал монет
+int coin_quantity[COIN_COUNT];                 // количество монет
+int coin_values[COIN_COUNT];                   // тут хранится значение сигнала для каждого номинала монеты
+
+Adafruit_SSD1306 display(128, 32, &Wire, -1);
+
+const unsigned char pig_rub[] PROGMEM = {
+    0x00, 0x07, 0x80, 0x00, 0x00, 0x0C, 0xC0, 0x00, 0x00, 0x18, 0x60, 0x00, 0x00, 0x31, 0x30, 0x00,
+    0x00, 0x22, 0x10, 0x00, 0x00, 0x22, 0x10, 0x00, 0x00, 0x31, 0x30, 0x00, 0x00, 0x10, 0x20, 0x00,
+    0x0E, 0xF8, 0x78, 0x00, 0x1B, 0x8F, 0xCE, 0x00, 0x12, 0x38, 0x73, 0x80, 0x18, 0x00, 0x00, 0xC0,
+    0x08, 0x00, 0x00, 0x60, 0x18, 0x0F, 0xC0, 0x20, 0x10, 0x0C, 0xE0, 0x26, 0x31, 0x0C, 0x30, 0x2D,
+    0x61, 0x0C, 0x30, 0x39, 0xC0, 0x0C, 0x30, 0x12, 0x90, 0x0C, 0x60, 0x10, 0xB0, 0x1F, 0xC0, 0x10,
+    0x80, 0x0C, 0x00, 0x10, 0xC0, 0x0C, 0x00, 0x10, 0x60, 0x1F, 0xE0, 0x30, 0x30, 0x0C, 0x00, 0x60,
+    0x1C, 0x0C, 0x00, 0x40, 0x06, 0x0C, 0x00, 0xC0, 0x03, 0x00, 0x01, 0x80, 0x01, 0x80, 0x07, 0x00,
+    0x01, 0x10, 0x24, 0x00, 0x01, 0x1F, 0xE4, 0x00, 0x01, 0xB0, 0x3C, 0x00, 0x00, 0xE0, 0x18, 0x00};
+
+const unsigned char pig_1[] PROGMEM = {
+    0x00, 0x07, 0x80, 0x00, 0x00, 0x0C, 0xC0, 0x00, 0x00, 0x18, 0x60, 0x00, 0x00, 0x31, 0x30, 0x00,
+    0x00, 0x22, 0x10, 0x00, 0x00, 0x22, 0x10, 0x00, 0x00, 0x31, 0x30, 0x00, 0x00, 0x10, 0x20, 0x00,
+    0x0E, 0xF8, 0x78, 0x00, 0x1B, 0x8F, 0xCE, 0x00, 0x12, 0x38, 0x73, 0x80, 0x18, 0x00, 0x00, 0xC0,
+    0x08, 0x00, 0x00, 0x60, 0x18, 0x03, 0x80, 0x20, 0x10, 0x07, 0x80, 0x26, 0x31, 0x0D, 0x80, 0x2D,
+    0x61, 0x09, 0x80, 0x39, 0xC0, 0x01, 0x80, 0x12, 0x90, 0x01, 0x80, 0x10, 0xB0, 0x01, 0x80, 0x10,
+    0x80, 0x01, 0x80, 0x10, 0xC0, 0x01, 0x80, 0x10, 0x60, 0x01, 0x80, 0x30, 0x30, 0x01, 0x80, 0x60,
+    0x1C, 0x0F, 0xF0, 0x40, 0x06, 0x00, 0x00, 0xC0, 0x03, 0x00, 0x01, 0x80, 0x01, 0x80, 0x07, 0x00,
+    0x01, 0x10, 0x24, 0x00, 0x01, 0x1F, 0xE4, 0x00, 0x01, 0xB0, 0x3C, 0x00, 0x00, 0xE0, 0x18, 0x00};
+
+const unsigned char pig_2[] PROGMEM = {
+    0x00, 0x07, 0x80, 0x00, 0x00, 0x0C, 0xC0, 0x00, 0x00, 0x18, 0x60, 0x00, 0x00, 0x31, 0x30, 0x00,
+    0x00, 0x22, 0x10, 0x00, 0x00, 0x22, 0x10, 0x00, 0x00, 0x31, 0x30, 0x00, 0x00, 0x10, 0x20, 0x00,
+    0x0E, 0xF8, 0x78, 0x00, 0x1B, 0x8F, 0xCE, 0x00, 0x12, 0x38, 0x73, 0x80, 0x18, 0x00, 0x00, 0xC0,
+    0x08, 0x00, 0x00, 0x60, 0x18, 0x07, 0xC0, 0x20, 0x10, 0x0F, 0xE0, 0x26, 0x31, 0x18, 0x30, 0x2D,
+    0x61, 0x18, 0x30, 0x39, 0xC0, 0x18, 0x70, 0x12, 0x90, 0x00, 0xE0, 0x10, 0xB0, 0x01, 0xC0, 0x10,
+    0x80, 0x03, 0x80, 0x10, 0xC0, 0x07, 0x00, 0x10, 0x60, 0x0E, 0x10, 0x30, 0x30, 0x1F, 0xF0, 0x60,
+    0x1C, 0x1F, 0xF0, 0x40, 0x06, 0x00, 0x00, 0xC0, 0x03, 0x00, 0x01, 0x80, 0x01, 0x80, 0x07, 0x00,
+    0x01, 0x10, 0x24, 0x00, 0x01, 0x1F, 0xE4, 0x00, 0x01, 0xB0, 0x3C, 0x00, 0x00, 0xE0, 0x18, 0x00};
+
+const unsigned char pig_5[] PROGMEM = {
+    0x00, 0x07, 0x80, 0x00, 0x00, 0x0C, 0xC0, 0x00, 0x00, 0x18, 0x60, 0x00, 0x00, 0x31, 0x30, 0x00,
+    0x00, 0x22, 0x10, 0x00, 0x00, 0x22, 0x10, 0x00, 0x00, 0x31, 0x30, 0x00, 0x00, 0x10, 0x20, 0x00,
+    0x0E, 0xF8, 0x78, 0x00, 0x1B, 0x8F, 0xCE, 0x00, 0x12, 0x38, 0x73, 0x80, 0x18, 0x00, 0x00, 0xC0,
+    0x08, 0x00, 0x00, 0x60, 0x18, 0x0F, 0xF0, 0x20, 0x10, 0x0C, 0x30, 0x26, 0x31, 0x0C, 0x00, 0x2D,
+    0x61, 0x0C, 0x00, 0x39, 0xC0, 0x0F, 0xC0, 0x12, 0x90, 0x00, 0x60, 0x10, 0xB0, 0x00, 0x30, 0x10,
+    0x80, 0x00, 0x30, 0x10, 0xC0, 0x00, 0x30, 0x10, 0x60, 0x0C, 0x30, 0x30, 0x30, 0x0C, 0x60, 0x60,
+    0x1C, 0x07, 0xC0, 0x40, 0x06, 0x00, 0x00, 0xC0, 0x03, 0x00, 0x01, 0x80, 0x01, 0x80, 0x07, 0x00,
+    0x01, 0x10, 0x24, 0x00, 0x01, 0x1F, 0xE4, 0x00, 0x01, 0xB0, 0x3C, 0x00, 0x00, 0xE0, 0x18, 0x00};
+
+const unsigned char pig_10[] PROGMEM = {
+    0x00, 0x07, 0x80, 0x00, 0x00, 0x0C, 0xC0, 0x00, 0x00, 0x18, 0x60, 0x00, 0x00, 0x31, 0x30, 0x00,
+    0x00, 0x22, 0x10, 0x00, 0x00, 0x22, 0x10, 0x00, 0x00, 0x31, 0x30, 0x00, 0x00, 0x10, 0x20, 0x00,
+    0x0E, 0xF8, 0x78, 0x00, 0x1B, 0x8F, 0xCE, 0x00, 0x12, 0x38, 0x73, 0x80, 0x18, 0x00, 0x00, 0xC0,
+    0x08, 0x00, 0x00, 0x60, 0x18, 0x38, 0x38, 0x20, 0x10, 0x78, 0x44, 0x26, 0x31, 0x58, 0xC6, 0x2D,
+    0x61, 0x18, 0xC6, 0x39, 0xC0, 0x18, 0xC6, 0x12, 0x90, 0x18, 0xC6, 0x10, 0xB0, 0x18, 0xC6, 0x10,
+    0x80, 0x18, 0xC6, 0x10, 0xC0, 0x18, 0xC6, 0x10, 0x60, 0x18, 0xC6, 0x30, 0x30, 0x18, 0x44, 0x60,
+    0x1C, 0x7E, 0x38, 0x40, 0x06, 0x00, 0x00, 0xC0, 0x03, 0x00, 0x01, 0x80, 0x01, 0x80, 0x07, 0x00,
+    0x01, 0x10, 0x24, 0x00, 0x01, 0x1F, 0xE4, 0x00, 0x01, 0xB0, 0x3C, 0x00, 0x00, 0xE0, 0x18, 0x00};
+
+const int PIG_RUB = 4;
+const unsigned char *pigs[5] = {pig_1, pig_2, pig_5, pig_10, pig_rub};
+
+void setup()
+{
+  clock_prescale_set(clock_div_2);
+
+  // Serial.begin(19200); // открыть порт для связи с ПК для отладки 9600*2
+
+  pinMode(BTN_AWAKE, OUTPUT);
+  pinMode(BTN_SERVICE, INPUT_PULLUP);
+  pinMode(LED_POWER, OUTPUT);
+  pinMode(IR_POWER, OUTPUT);
+  pinMode(IR_VALUE, INPUT);
+  digitalWrite(LED_POWER, HIGH);
+  digitalWrite(IR_POWER, HIGH);
+  attachInterrupt(digitalPinToInterrupt(BTN_AWAKE), wake_up, RISING);
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C))
+  {
+    // Serial.println(F("SSD1306 allocation failed"));
+    for (;;)
+      ;
+  }
+
+  display.clearDisplay();
+  display.dim(true);
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.display();
+
+  // если при запуске нажата кнопка калибровки (по умолчанию на ней HIGH)
+  if (!digitalRead(BTN_SERVICE))
+  {
+    service();
+  }
+
+  uint16_t val_addr;
+  int quantity_addr;
+  // при старте системы считать из памяти сигналы монет для дальнейшей работы, а также их количество в банке
+  for (int i = 0; i < COIN_COUNT; i++)
+  {
+    val_addr = i * 2;                          // читаем значения сигналов, word занимает 2 байта -> uint_16
+    quantity_addr = COIN_COUNT * 2 + val_addr; // смещаем указатель на количество монет умноженных на 2 байта
+    coin_values[i] = eeprom_read_word((uint16_t *)val_addr);
+    coin_quantity[i] = eeprom_read_word((uint16_t *)quantity_addr);
+    total += coin_nominals[i] * coin_quantity[i]; // подсчет суммы как произведение номинала монеты на количество
+  }
+}
+
+/**
+ * Функция калибровки. Последовательно посылаются монеты для регистрации сигнала
+ * Если кнопка продолжает удерживаться в течение 3с - память очищается
+ **/
+void service()
+{
+  unsigned long timer_reset = millis();
+  unsigned long diff;
+  uint16_t addr;
+
+  while (true)
+  { // бесконечный цикл
+    diff = millis() - timer_reset;
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.print("Clearing memory: ");
+    display.print((3000 - diff) / 1000);
+    display.display();
+    if (diff > 3000)
+    {
+      for (int i = 0; i < COIN_COUNT; i++)
+      {
+        addr = COIN_COUNT * 2 + i * 2;
+        eeprom_write_word((uint16_t *)addr, 0);
+      }
+      display.println("Memory cleared");
+      display.display();
+      delay(1500);
+      break;
+    }
+    if (digitalRead(BTN_SERVICE)) // если отпустили кнопку, перейти к калибровке
+    {
+      break;
+    }
+  }
+
+  uint16_t val;
+  int row = 16;
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.print("Calibrating: ");
+  display.display();
+  for (int i = 0; i < COIN_COUNT; i++)
+  {
+    if (i >= 2)
+    {
+      row = 24;
+    }
+    display.setCursor(i % 2 * 64, row);
+    display.print(coin_nominals[i]);
+    display.print("(");
+    val = get_coin_value();
+    display.print(val);
+    display.print(")");
+    display.display();
+    if (val == 0)
+      return;
+    coin_values[i] = val;
+    addr = i * 2;
+    eeprom_write_word((uint16_t *)addr, val);
+  }
+}
+
+/** 
+ * Ожидает монету и возвращает полученное значение
+ * Если возвращает нулевое значение, значит, алгоритм устал ждать и пора уходить в сон
+ * В процессе ожидания может быть вызвано сервисное меню детализации, в котором детально 
+ * отражена информация о количестве монет и величине сигнала
+ **/
+int get_coin_value()
+{
+  unsigned long standby = millis(); // таймер дорствования
+  boolean is_coin = false;          // признак пролетающей монеты
+  int zero_value, current_value, max_value;
+  zero_value = analogRead(IR_VALUE);
+  max_value = zero_value;
+  while (millis() - standby <= SLEEP_TIME)
+  {
+    handle_detail();
+    current_value = analogRead(IR_VALUE);
+    if (current_value > max_value)
+    {
+      max_value = current_value;
+    }
+    if (current_value - zero_value > 50) // начинает темнеть, монета полетела
+    {
+      is_coin = true;
+    }
+    if (is_coin && (abs(current_value - zero_value)) < 50) // монета летит и уже посветлело до исходного
+    {
+      standby = millis();
+
+      return max_value;
+    }
+  }
+
+  return 0;
+}
+
+/**
+ * Выводит информацию о балансе
+ **/
+void print_total(int pig_id = PIG_RUB)
+{
+  display.clearDisplay();
+  display.drawBitmap(0, 0, pigs[pig_id], 32, 32, WHITE);
+  display.setTextSize(2);
+  display.setCursor(33, 0);
+  display.print("FORaDOG");
+  display.setCursor(0, 16);
+  int16_t x, y, x1, y1 = 0;
+  uint16_t w, h;
+  display.getTextBounds(String(total), x, y, &x1, &y1, &w, &h);
+  display.setCursor(128 - w, 16);
+  display.print(total);
+  display.display();
+}
+
+/**
+ * Основной цикл
+ **/
+void loop()
+{
+  if (is_sleep)
+  {
+    display.ssd1306_command(SSD1306_DISPLAYON);
+    delay(50);
+    print_total();
+    is_sleep = false;
+  }
+
+  int found = 0;
+  int min_delta = 1024;
+  int val = get_coin_value(); // здесь программа проводит больше всего времени
+  if (val == 0)
+  {
+    good_night();
+    return;
+  }
+  for (int i = 0; i < COIN_COUNT; i++)
+  {
+    int delta = abs(val - coin_values[i]);
+    if (delta < min_delta) // находим минимальное отклонение от ближайшего значения монетки
+    {
+      min_delta = delta;
+      found = i;
+    }
+  }
+  total += coin_nominals[found];
+  coin_quantity[found]++; // для распознанного номера монетки прибавляем количество
+  print_total(found);
+  delay(125);
+  print_total();
+}
+
+/** 
+ * Отправляет МК в сон
+ * Перед тем как уснуть записывает в EEPROM новые полученные количества монет по адресам
+ * Отключает питание всех датчиков и дислпея
+ **/
+void good_night()
+{
+  //
+  int addr;
+  for (int i = 0; i < COIN_COUNT; i++)
+  {
+    addr = COIN_COUNT * 2 + i * 2;
+    eeprom_update_word((uint16_t *)addr, coin_quantity[i]);
+  }
+  is_sleep = true;
+  // вырубить питание дисплея и датчиков
+  display.ssd1306_command(SSD1306_DISPLAYOFF);
+  digitalWrite(LED_POWER, LOW);
+  digitalWrite(IR_POWER, LOW);
+  LowPower.powerDown(SLEEP_FOREVER, ADC_OFF, BOD_OFF);
+}
+
+/** 
+ * Пробуждает МК по прерываению
+ * Возвращает питание на датчики и дислпей
+ **/
+void wake_up()
+{
+  digitalWrite(LED_POWER, HIGH);
+  digitalWrite(IR_POWER, HIGH);
+}
+
+/**
+ * Выводит детальную информацию о количестве монет и уровне записанного сигнала
+ * Создает задержку для обработчика в 5с
+ **/
+void handle_detail()
+{
+  if (!digitalRead(BTN_AWAKE))
+  {
+    return;
+  }
+  unsigned long timer = millis();
+  while (millis() - timer < 1500)
+    ;
+  if (!digitalRead(BTN_AWAKE))
+  {
+    return;
+  }
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.print("Detailing...");
+  int row = 16;
+  for (int i = 0; i < COIN_COUNT; i++)
+  {
+    if (i >= 2)
+    {
+      row = 24;
+    }
+    display.setCursor(i % 2 * 64, row);
+    display.print(coin_nominals[i]);
+    display.print(":");
+    display.print(coin_quantity[i]);
+    display.print(" (");
+    display.print(coin_values[i]);
+    display.print(")");
+    display.display();
+    if (2 == 1)
+    {
+      break;
+    }
+  }
+  delay(2500);
+  print_total();
+}
